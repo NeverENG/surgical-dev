@@ -57,8 +57,9 @@ def paths(root):
     return set(name(p) for p in raw.split(b"\0") if p)
 
 
-def scan(root):
-    return {p: fingerprint(root / p) for p in sorted(paths(root))}
+def scan(root, explicit=()):
+    # Explicitly allowlisted ignored paths are still part of the baseline.
+    return {p: fingerprint(root / p) for p in sorted(paths(root) | set(explicit))}
 
 
 def index(root):
@@ -100,7 +101,7 @@ def start(args):
     allowed = {valid_path(p): "初始任务范围" for p in args.allow}
     if not allowed:
         raise ValueError("至少提供一个 --allow 具体文件；不得用整个目录放行")
-    baseline = scan(root)
+    baseline = scan(root, allowed)
     _, staged = index(root)
     # mkdtemp uses owner-only permissions and lives outside the target repository.
     state = Path(tempfile.mkdtemp(prefix="surgical-dev-gate-"))
@@ -121,7 +122,7 @@ def extend(args):
         raise ValueError("扩展范围必须提供对应契约和必要性")
     if p in manifest["allowed"]:
         raise ValueError(f"文件已在范围中: {p}；同文件中新区域在最终差异审阅中说明")
-    current = scan(root)
+    current = scan(root, [p])
     if current.get(p, "absent") != manifest["baseline"].get(p, "absent"):
         raise ValueError(f"文件已被修改，不能事后放行: {p}；先处理越界修改")
     _, staged = index(root)
@@ -171,7 +172,7 @@ def check(args):
     root = Path(manifest["root"])
     if root_of(root) != root:
         raise ValueError("工作区根目录已改变")
-    current = scan(root)
+    current = scan(root, manifest["allowed"])
     _, staged = index(root)
     all_paths = set(manifest["baseline"]) | set(current) | set(manifest["index"]) | set(staged)
     changed = sorted(p for p in all_paths if
@@ -192,7 +193,9 @@ def check(args):
                                manifest["index"].get(p), staged.get(p))
     print(f"本次指纹: {digest}")
     if nontext:
-        print("存在无法在此显示的差异；请单独检查并确认后才可签核。", file=sys.stderr)
+        print("存在无法在此显示的差异；请单独检查后加 --binary-reviewed 签核。", file=sys.stderr)
+        if not args.binary_reviewed:
+            return 3
     if args.attest != digest:
         print("尚未逐段签核，或指纹已过期；闸门拒绝。", file=sys.stderr)
         return 3
@@ -213,6 +216,8 @@ def main():
     p = commands.add_parser("check", help="检查范围、展示差异并使用本次指纹签核")
     p.add_argument("--state", required=True)
     p.add_argument("--attest")
+    p.add_argument("--binary-reviewed", action="store_true",
+                   help="确认已使用其他工具独立检查非文本差异")
     args = parser.parse_args()
     try:
         return {"start": start, "extend": extend, "check": check}[args.command](args) or 0

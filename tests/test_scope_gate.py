@@ -1,6 +1,7 @@
 """Behavioral checks for the post-change scope gate."""
 
 import re
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -26,7 +27,7 @@ class ScopeGateTest(unittest.TestCase):
         result = self.gate("start", "--repo", str(self.repo), "--allow", "app.py")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.state = re.search(r"状态目录: (.+)", result.stdout).group(1)
-        self.addCleanup(lambda: __import__("shutil").rmtree(self.state))
+        self.addCleanup(lambda: shutil.rmtree(self.state))
 
     def run_git(self, *args):
         result = subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True)
@@ -76,6 +77,44 @@ class ScopeGateTest(unittest.TestCase):
         (self.repo / "other.py").write_text("staged\n")
         self.run_git("add", "other.py")
         (self.repo / "other.py").write_text("keep\n")
+        self.assertEqual(self.check().returncode, 2)
+
+    def test_explicit_ignored_file_is_monitored(self):
+        (self.repo / ".gitignore").write_text("ignored.cfg\n")
+        (self.repo / "ignored.cfg").write_text("old\n")
+        self.run_git("add", ".gitignore")
+        self.run_git("commit", "-qm", "ignore config")
+        second = self.gate("start", "--repo", str(self.repo), "--allow", "ignored.cfg")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        another_state = re.search(r"状态目录: (.+)", second.stdout).group(1)
+        self.addCleanup(lambda: shutil.rmtree(another_state))
+        (self.repo / "ignored.cfg").write_text("new\n")
+        review = self.gate("check", "--state", another_state)
+        self.assertEqual(review.returncode, 3)
+        self.assertIn("ignored.cfg", review.stdout)
+        self.assertIn("+new", review.stdout)
+
+    def test_binary_change_needs_separate_review_flag(self):
+        (self.repo / "app.py").write_bytes(b"\x00new bytes")
+        review = self.check()
+        self.assertEqual(review.returncode, 3)
+        digest = re.search(r"本次指纹: ([a-f0-9]+)", review.stdout).group(1)
+        self.assertEqual(self.check("--attest", digest).returncode, 3)
+        self.assertEqual(self.check("--attest", digest, "--binary-reviewed").returncode, 0)
+
+    def test_preexisting_dirty_file_is_baseline_not_task_change(self):
+        (self.repo / "other.py").write_text("preexisting\n")
+        second = self.gate("start", "--repo", str(self.repo), "--allow", "app.py")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        another_state = re.search(r"状态目录: (.+)", second.stdout).group(1)
+        self.addCleanup(lambda: shutil.rmtree(another_state))
+        (self.repo / "app.py").write_text("changed\n")
+        result = self.gate("check", "--state", another_state)
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn("other.py", result.stdout)
+
+    def test_out_of_scope_deletion_is_rejected(self):
+        (self.repo / "other.py").unlink()
         self.assertEqual(self.check().returncode, 2)
 
 
