@@ -1,35 +1,33 @@
-"""Behavioral checks for the post-change scope gate."""
+"""Exercise the scope audit against real Git worktrees, not source text."""
 
 import re
 import shutil
-from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "scope_gate.py"
 
 
-class ScopeGateTest(unittest.TestCase):
+class ScopeAuditTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.repo = Path(self.tmp.name)
-        self.run_git("init", "-q")
-        self.run_git("config", "user.name", "Test")
-        self.run_git("config", "user.email", "test@example.com")
-        (self.repo / "app.py").write_text("first\n")
+        self.git("init", "-q")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "test@example.com")
+        (self.repo / "src").mkdir()
+        (self.repo / "src/app.py").write_text("original\n")
         (self.repo / "other.py").write_text("keep\n")
-        self.run_git("add", ".")
-        self.run_git("commit", "-qm", "initial")
-        result = self.gate("start", "--repo", str(self.repo), "--allow", "app.py")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.state = re.search(r"状态目录: (.+)", result.stdout).group(1)
-        self.addCleanup(lambda: shutil.rmtree(self.state))
+        self.git("add", ".")
+        self.git("commit", "-qm", "initial")
+        self.state = self.start()
 
-    def run_git(self, *args):
+    def git(self, *args):
         result = subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -37,85 +35,101 @@ class ScopeGateTest(unittest.TestCase):
         return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=self.repo,
                               text=True, capture_output=True)
 
-    def check(self, *args):
-        return self.gate("check", "--state", self.state, *args)
-
-    def test_attestation_uses_exact_current_diff(self):
-        (self.repo / "app.py").write_text("first\nneeded\n")
-        review = self.check()
-        self.assertEqual(review.returncode, 3)
-        self.assertIn("+needed", review.stdout)
-        digest = re.search(r"本次指纹: ([a-f0-9]+)", review.stdout).group(1)
-        self.assertEqual(self.check("--attest", digest).returncode, 0)
-        (self.repo / "app.py").write_text("first\nneeded\nunrelated\n")
-        self.assertEqual(self.check("--attest", digest).returncode, 3)
-
-    def test_unrelated_change_fails_and_cannot_be_allowlisted_afterwards(self):
-        (self.repo / "other.py").write_text("oops\n")
-        self.assertEqual(self.check().returncode, 2)
-        result = self.gate("extend", "--state", self.state, "--allow", "other.py",
-                           "--reason", "necessary for the contract")
-        self.assertEqual(result.returncode, 2)
-
-    def test_new_file_must_be_allowlisted_before_editing(self):
-        result = self.gate("extend", "--state", self.state, "--allow", "new.py",
-                           "--reason", "necessary for the contract")
+    def start(self, *extras):
+        result = self.gate("start", "--repo", str(self.repo), "--scope", "src/", *extras)
         self.assertEqual(result.returncode, 0, result.stderr)
-        (self.repo / "new.py").write_text("new\n")
-        self.assertEqual(self.check().returncode, 3)
+        state = re.search(r"状态目录: (.+)", result.stdout).group(1)
+        self.addCleanup(lambda: shutil.rmtree(state))
+        return state
 
-    def test_staged_only_content_is_visible_for_review(self):
-        (self.repo / "app.py").write_text("staged\n")
-        self.run_git("add", "app.py")
-        (self.repo / "app.py").write_text("first\n")
-        review = self.check()
-        self.assertEqual(review.returncode, 3)
-        self.assertIn("暂存区与工作区内容不同", review.stdout)
-        self.assertIn("+staged", review.stdout)
+    def check(self, *args, state=None):
+        return self.gate("check", "--state", state or self.state, *args)
 
-    def test_out_of_scope_index_only_change_is_rejected(self):
+    def test_in_scope_change_passes_without_second_signature(self):
+        (self.repo / "src/app.py").write_text("changed\n")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("+changed", result.stdout)
+        self.assertIn("src/app.py", result.stdout)
+
+    def test_outside_scope_fails_until_explained(self):
+        (self.repo / "other.py").write_text("needed\n")
+        self.assertEqual(self.check().returncode, 2)
+        result = self.check("--explain", "other.py=本次功能必须调用现有适配层")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("本次功能必须调用现有适配层", result.stdout)
+
+    def test_preexisting_dirty_file_is_preserved_not_misattributed(self):
+        (self.repo / "other.py").write_text("preexisting\n")
+        state = self.start()
+        (self.repo / "src/app.py").write_text("new\n")
+        result = self.check(state=state)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("other.py", result.stdout)
+        (self.repo / "other.py").write_text("changed again\n")
+        self.assertEqual(self.check(state=state).returncode, 2)
+
+    def test_new_file_in_scope_passes_and_outside_fails(self):
+        (self.repo / "src/new.py").write_text("new\n")
+        self.assertEqual(self.check().returncode, 0)
+        (self.repo / "outside.py").write_text("new\n")
+        self.assertEqual(self.check().returncode, 2)
+
+    def test_staged_only_change_is_detected_and_reviewable(self):
+        (self.repo / "src/app.py").write_text("staged\n")
+        self.git("add", "src/app.py")
+        (self.repo / "src/app.py").write_text("original\n")
+        result = self.check()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("+staged", result.stdout)
+        self.assertIn("暂存区", result.stdout)
+
+    def test_outside_staged_only_change_fails(self):
         (self.repo / "other.py").write_text("staged\n")
-        self.run_git("add", "other.py")
+        self.git("add", "other.py")
         (self.repo / "other.py").write_text("keep\n")
         self.assertEqual(self.check().returncode, 2)
 
+    def test_scope_explanation_is_remembered_for_later_checks(self):
+        (self.repo / "other.py").write_text("needed\n")
+        first = self.check("--explain", "other.py=本次功能新增的必要调用方接口")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(self.check().returncode, 0)
+
+    def test_new_commit_invalidates_baseline(self):
+        self.git("commit", "--allow-empty", "-qm", "later")
+        result = self.check()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("HEAD", result.stderr)
+
+    def test_preexisting_in_scope_edit_is_not_hidden_in_review(self):
+        (self.repo / "src/app.py").write_text("user edit\n")
+        state = self.start()
+        (self.repo / "src/app.py").write_text("user edit\nnew behavior\n")
+        result = self.check(state=state)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("+new behavior", result.stdout)
+        self.assertNotIn("-original", result.stdout)
+
+    def test_binary_requires_independent_review(self):
+        (self.repo / "src/app.py").write_bytes(b"\x00changed")
+        self.assertEqual(self.check().returncode, 3)
+        self.assertEqual(self.check("--binary-reviewed").returncode, 0)
+
     def test_explicit_ignored_file_is_monitored(self):
-        (self.repo / ".gitignore").write_text("ignored.cfg\n")
-        (self.repo / "ignored.cfg").write_text("old\n")
-        self.run_git("add", ".gitignore")
-        self.run_git("commit", "-qm", "ignore config")
-        second = self.gate("start", "--repo", str(self.repo), "--allow", "ignored.cfg")
-        self.assertEqual(second.returncode, 0, second.stderr)
-        another_state = re.search(r"状态目录: (.+)", second.stdout).group(1)
-        self.addCleanup(lambda: shutil.rmtree(another_state))
-        (self.repo / "ignored.cfg").write_text("new\n")
-        review = self.gate("check", "--state", another_state)
-        self.assertEqual(review.returncode, 3)
-        self.assertIn("ignored.cfg", review.stdout)
-        self.assertIn("+new", review.stdout)
+        (self.repo / ".gitignore").write_text("src/secret.cfg\n")
+        (self.repo / "src/secret.cfg").write_text("old\n")
+        self.git("add", ".gitignore")
+        self.git("commit", "-qm", "ignore config")
+        state = self.start("--include", "src/secret.cfg")
+        (self.repo / "src/secret.cfg").write_text("new\n")
+        result = self.check(state=state)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("src/secret.cfg", result.stdout)
 
-    def test_binary_change_needs_separate_review_flag(self):
-        (self.repo / "app.py").write_bytes(b"\x00new bytes")
-        review = self.check()
-        self.assertEqual(review.returncode, 3)
-        digest = re.search(r"本次指纹: ([a-f0-9]+)", review.stdout).group(1)
-        self.assertEqual(self.check("--attest", digest).returncode, 3)
-        self.assertEqual(self.check("--attest", digest, "--binary-reviewed").returncode, 0)
-
-    def test_preexisting_dirty_file_is_baseline_not_task_change(self):
-        (self.repo / "other.py").write_text("preexisting\n")
-        second = self.gate("start", "--repo", str(self.repo), "--allow", "app.py")
-        self.assertEqual(second.returncode, 0, second.stderr)
-        another_state = re.search(r"状态目录: (.+)", second.stdout).group(1)
-        self.addCleanup(lambda: shutil.rmtree(another_state))
-        (self.repo / "app.py").write_text("changed\n")
-        result = self.gate("check", "--state", another_state)
-        self.assertEqual(result.returncode, 3)
-        self.assertNotIn("other.py", result.stdout)
-
-    def test_out_of_scope_deletion_is_rejected(self):
-        (self.repo / "other.py").unlink()
-        self.assertEqual(self.check().returncode, 2)
+    def test_root_wide_scope_is_rejected(self):
+        self.assertEqual(self.gate("start", "--repo", str(self.repo),
+                                   "--scope", ".").returncode, 2)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
 interface:
   display_name: "手术刀开发"
-  short_description: "基础架构确定后按契约和测试执行开发，以范围闸门拦截无关改动"
+  short_description: "基础架构确定后按契约和测试执行开发，以轻量差异审计拦截无关改动"
   default_prompt: "使用 $surgical-dev 在基础架构和方案已确定的前提下完成这项开发，并检查测试、变更范围和用户体验。"
